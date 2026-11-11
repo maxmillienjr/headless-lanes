@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the lanes sweep and lint every night
+
+[Timer]
+OnCalendar=*-*-* 23:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

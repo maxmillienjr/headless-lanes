@@ -1,0 +1,13 @@
+[Unit]
+Description=Lane: dispatcher, works [product] decisions a human approved (main seat)
+OnFailure=lane-failed@%n.service
+
+[Service]
+Type=oneshot
+# Exit 1 from dispatch-check means nothing is approved and waiting. systemd then skips the
+# unit ("condition unmet"): no seat is woken, no run row is written, and nothing has failed.
+# A broken setup (no database, a bad lanes.toml) exits 255 instead, which fails the unit and
+# fires OnFailure=, so it can't pass for an empty queue.
+ExecCondition=%h/headless-lanes/bin/lanes dispatch-check product
+ExecStart=%h/headless-lanes/bin/lane-run.sh main dispatcher
+TimeoutStartSec=95m

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# A stand-in for the `claude` binary, for the tests and for the console demo's Run now button.
+# It sleeps, then prints the same JSON envelope `claude -p --output-format json` prints.
+#   FAKE_CLAUDE_SLEEP  seconds to "work" (default 2)
+#   FAKE_CLAUDE_FAIL   set to make the envelope an error
+#   FAKE_CLAUDE_ORPHAN seconds a background child keeps running after this exits
+[ -n "${FAKE_CLAUDE_ORPHAN:-}" ] && { sleep "$FAKE_CLAUDE_ORPHAN" >/dev/null 2>&1 & }
+sleep "${FAKE_CLAUDE_SLEEP:-2}"
+key=unset
+[ -n "${ANTHROPIC_API_KEY:-}" ] && key=set
+input=no
+case "$*" in *"## Input from the caller"*) input=yes ;; esac
+err=false
+[ -n "${FAKE_CLAUDE_FAIL:-}" ] && err=true
+ms=$(awk "BEGIN { printf \"%d\", ${FAKE_CLAUDE_SLEEP:-2} * 1000 }")
+cat <<EOF
+{"type": "result", "is_error": $err, "duration_ms": $ms, "num_turns": 7,
+ "result": "Stand-in run finished. api_key=$key seat_dir=$(basename "${CLAUDE_CONFIG_DIR:-none}") caller_input=$input",
+ "session_id": "fake-$$", "total_cost_usd": 0,
+ "usage": {"input_tokens": 1200, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 300}}
+EOF
+[ "$err" = true ] && exit 1
+exit 0

@@ -1,0 +1,18 @@
+# Template for one lane. Copy to lane-<name>.service and change the two names on ExecStart.
+[Unit]
+Description=Lane: <name> (<seat> seat)
+# A unit that fails for any reason hands its name to lane-failed@, which puts the newest log
+# for that lane in the inbox. The runner does the same for runs it saw fail; this catches the
+# ones it never saw (a systemd timeout, a bad ExecCondition).
+OnFailure=lane-failed@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/headless-lanes/bin/lane-run.sh <seat> <name>
+# Longer than the runner's worst case: up to 30 minutes waiting for the seat (LANE_LOCK_WAIT)
+# plus a 55-minute run (LANE_TIMEOUT) plus a minute to stop. The runner must be the one that
+# ends the run, because only the runner writes the row. Raise this if you raise either.
+TimeoutStartSec=95m
+# Point a lane at another project's lanes folder and database:
+# Environment=LANES_DIR=%h/myproject/lanes
+# Environment=LANES_DB=%h/.local/share/headless-lanes/lanes.db

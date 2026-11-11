@@ -1,0 +1,12 @@
+[Unit]
+Description=Dispatcher twice a day
+
+[Timer]
+# Two lines, one per time. "07:30,19:00" on one line means 07:19 and 07:30.
+OnCalendar=*-*-* 07:30
+OnCalendar=*-*-* 19:00
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

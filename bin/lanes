@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+"""lanes: the bookkeeping behind headless lanes. One SQLite file, four tables, no dependencies.
+
+  lanes init                                    create the database
+  lanes log-run <seat> <lane> --status ok ...   one row per run (the runner calls this)
+  lanes runs [-n 20]                            recent runs
+  lanes deliver <lane> <kind> <path|url> title="..." [needs=act|read|fyi|parked]
+                                   [decision=D-n] [expires=YYYY-MM-DD] [source=...]
+  lanes inbox-sweep [--dry-run]                 clear inbox rows that no longer need a human
+  lanes lint [--digest]                         lanes past cadence, failed runs, seat budget, stray files
+  lanes nightly                                 sweep, then lint; warnings land in the inbox
+  lanes failed <unit|lane>                      OnFailure= handler: put the dead run's log in the inbox
+  lanes queue add <label> "<title>" [--body TEXT | --body-file FILE]
+  lanes queue list [--state todo] [--label L] | show <id>
+  lanes queue approve|decline|done|hand-back|reopen <id> [--comment TEXT] [--as agent]
+  lanes queue comment <id> "<text>" [--as agent]
+  lanes queue pull                              copy states from Linear (only with LINEAR_API_KEY)
+  lanes dispatch-check [label]                  approved decisions a dispatcher should work; exit 1 if none
+  lanes seat-dir <seat>                         the seat's Claude config directory
+  lanes stopped [lane]                          exit 0 and print the STOP file if the kill switch is on
+  lanes seed-demo <dir>                         made-up data, written only inside <dir>
+
+Env: LANES_DB (default ~/.local/share/headless-lanes/lanes.db), LANES_DIR (the folder holding
+<lane>.md prompts and lanes.toml; default ./lanes beside this script's repo), LANES_LOG_DIR
+(default: logs/ beside the database), LINEAR_API_KEY + LINEAR_TEAM (optional mirror).
+"""
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import sqlite3
+import sys
+import tomllib
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+KINDS = ("draft", "batch", "prospects", "report", "digest", "guide", "other")
+# What the human has to do with an inbox item. act = a decision, a send, a paste. read = worth
+# reading, no decision. fyi = a record; the sweep clears it after FYI_DAYS. parked = waiting on
+# an outside event, hidden behind a count. The producer says which; otherwise the kind decides.
+NEEDS = ("act", "read", "fyi", "parked")
+NEEDS_BY_KIND = {"draft": "act", "batch": "act", "prospects": "act", "guide": "read",
+                 "report": "fyi", "digest": "fyi", "other": "fyi"}
+FYI_DAYS = 3
+SCAN_DAYS = 14  # lint looks this far back for files nothing registered
+# Decision states and the moves between them. An approval is the only way into in_progress
+# (made here, or made in the mirrored tracker and copied in by `queue pull`), and in_progress
+# is the only state a dispatcher will touch.
+MOVES = {"approve": (("todo", "in_progress"), "in_progress"),
+         "decline": (("todo", "in_progress"), "declined"),
+         "done": (("todo", "in_progress"), "done"),
+         "hand-back": (("in_progress",), "todo"),
+         "reopen": (("done", "declined"), "todo")}
+LINEAR_STATE = {"todo": "Todo", "in_progress": "In Progress", "done": "Done", "declined": "Canceled"}
+CONTINUING = "[continuing]"
+QUIET_MIN = 20  # an agent comment this recent means a run is on the decision right now
+NETWORK_FS = ("fuse", "nfs", "cifs", "smb", "9p", "sshfs", "davfs")
+
+SCHEMA = """
+create table if not exists lane_runs (
+  id integer primary key, seat text not null, lane text not null,
+  started text not null, ended text default '', duration_s integer default 0,
+  turns integer, cost_usd real, input_tokens integer, output_tokens integer,
+  status text not null,            -- ok | error | timeout | locked
+  session_id text default '', log text default '', summary text default '');
+create index if not exists lane_runs_lane on lane_runs (lane, started);
+create table if not exists deliverables (
+  id integer primary key, date text not null, lane text not null, kind text not null,
+  title text not null, path text default '', url text default '', decision text default '',
+  needs text not null, status text not null default 'unread',   -- unread | read | acted | superseded
+  expires text default '', note text default '', source text default '',
+  created_at text not null, updated_at text not null);
+create table if not exists decisions (
+  id integer primary key, label text not null, title text not null, body text default '',
+  state text not null default 'todo',   -- todo | in_progress | done | declined
+  created_at text not null, updated_at text not null, approved_at text default '',
+  external_id text default '', external_url text default '');
+create table if not exists decision_comments (
+  id integer primary key, decision_id integer not null references decisions (id),
+  author text not null,                 -- human | agent
+  body text not null, created_at text not null);
+"""
+
+
+# ---------------------------------------------------------------- paths, config, time
+def db_path():
+    return os.path.expanduser(os.environ.get("LANES_DB", "~/.local/share/headless-lanes/lanes.db"))
+
+
+def lanes_dir():
+    return os.path.expanduser(os.environ.get("LANES_DIR", os.path.join(ROOT, "lanes")))
+
+
+def log_dir():
+    return os.path.expanduser(os.environ.get("LANES_LOG_DIR", os.path.join(os.path.dirname(db_path()), "logs")))
+
+
+def config():
+    """lanes.toml: seats (config dir, weekly budget), lanes (seat, cadence, schedule), inbox roots."""
+    try:
+        with open(os.path.join(lanes_dir(), "lanes.toml"), "rb") as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    for k in ("seats", "lanes", "inbox"):
+        cfg.setdefault(k, {})
+    return cfg
+
+
+def seat_dir(seat, cfg=None):
+    """A seat is one Claude Code login with its own config directory."""
+    s = (cfg or config())["seats"].get(seat, {})
+    return os.path.expanduser(s.get("config_dir") or ("~/.claude" if seat == "main" else f"~/.claude-{seat}"))
+
+
+def stop_file(lane=None):
+    """The kill switch: a file named STOP beside the database pauses every lane, <lane>.STOP
+    pauses one. The runner checks before it takes a seat. Returns the file's path, or ''."""
+    state = os.path.dirname(db_path())
+    for name in ("STOP", f"{lane}.STOP" if lane else None):
+        if name and os.path.exists(os.path.join(state, name)):
+            return os.path.join(state, name)
+    return ""
+
+
+def now():
+    return dt.datetime.now()
+
+
+def stamp(d=None, fine=False):
+    return (d or now()).isoformat(timespec="microseconds" if fine else "seconds")
+
+
+def parse_ts(s):
+    """ISO text to a naive local datetime (the runner's `date -Is` carries an offset)."""
+    d = dt.datetime.fromisoformat(s)
+    return d.astimezone().replace(tzinfo=None) if d.tzinfo else d
+
+
+def tilde(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
+
+
+def fs_type(path, mounts=None):
+    """Filesystem type of the mount holding `path` ('' when it can't be told)."""
+    if mounts is None:
+        try:
+            with open("/proc/mounts") as f:
+                mounts = f.read()
+        except OSError:
+            return ""
+    best, kind = "", ""
+    for line in mounts.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mp = parts[1].replace("\\040", " ")
+        if (path == mp or path.startswith(mp.rstrip("/") + "/")) and len(mp) > len(best):
+            best, kind = mp, parts[2]
+    return kind
+
+
+def connect():
+    path = db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # SQLite on a FUSE or network mount corrupts sooner or later (locking is advisory at best
+    # there). Keep the database on a local disk and back it up to the mount instead.
+    kind = fs_type(os.path.realpath(path))  # fuseblk is a local NTFS or exFAT disk, which is fine
+    if kind.startswith(NETWORK_FS) and kind != "fuseblk" and not os.environ.get("LANES_ALLOW_ANY_FS"):
+        sys.exit(f"lanes: {path} is on a {kind} mount. Put the database on a local disk "
+                 "(set LANES_DB), or set LANES_ALLOW_ANY_FS=1 if you know better.")
+    db = sqlite3.connect(path, timeout=30)
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    return db
+
+
+# ---------------------------------------------------------------- run log
+def log_run(db, seat, lane, status, started, ended="", envelope=None, log=None, no_summary=False):
+    """Record one run. `envelope` is the file `claude -p --output-format json` wrote: duration,
+    turns, usage, session id, the final result. Returns (row id, final status)."""
+    row = {"seat": seat, "lane": lane, "status": status, "started": stamp(parse_ts(started)),
+           "ended": stamp(parse_ts(ended)) if ended else "", "log": tilde(os.path.realpath(log)) if log else ""}
+    result = ""
+    if envelope and os.path.isfile(envelope) and os.path.getsize(envelope):
+        try:
+            with open(envelope) as f:
+                env = json.load(f)
+            usage = env.get("usage") or {}
+            row.update(duration_s=round((env.get("duration_ms") or 0) / 1000), turns=env.get("num_turns"),
+                       cost_usd=env.get("total_cost_usd"), output_tokens=usage.get("output_tokens"),
+                       input_tokens=sum(usage.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                                                    "cache_creation_input_tokens")),
+                       session_id=env.get("session_id") or "")
+            result = (env.get("result") or "").strip()
+            if env.get("is_error") and row["status"] == "ok":
+                row["status"] = "error"
+            row["summary"] = "(not recorded for this seat; see the log)" if no_summary else result[-400:]
+        except (ValueError, OSError, AttributeError) as e:
+            row["summary"] = f"(envelope unreadable: {e})"
+    if not row.get("duration_s") and row["ended"]:
+        row["duration_s"] = round((parse_ts(row["ended"]) - parse_ts(row["started"])).total_seconds())
+    if log and os.path.isfile(log):
+        with open(log, "a") as f:
+            f.write(f"\n==== result: {row['status']}, {row['started']} .. {row['ended']} ====\n{result}\n")
+    cols = list(row)
+    cur = db.execute(f"insert into lane_runs ({', '.join(cols)}) values ({', '.join('?' * len(cols))})",
+                     [row[k] for k in cols])
+    db.commit()
+    return cur.lastrowid, row["status"]
+
+
+def open_failures(db, days=7, at=None):
+    """Runs that did not end ok in the last `days`, unless a later run of the same lane on the
+    same seat ended ok (a failure stops counting once the lane has recovered)."""
+    since = stamp((at or now()) - dt.timedelta(days=days))
+    return db.execute(
+        "select * from lane_runs f where status != 'ok' and started >= ? and not exists (select 1 from "
+        "lane_runs o where o.lane = f.lane and o.seat = f.seat and o.status = 'ok' and o.started > f.started) "
+        "order by started desc", (since,)).fetchall()
+
+
+def past_cadence(db, cfg=None, at=None):
+    """[(lane, days, last ok run or None)] for lanes whose last ok run is older than cadence_days."""
+    out = []
+    for lane, spec in sorted((cfg or config())["lanes"].items()):
+        days = spec.get("cadence_days")
+        if not days:
+            continue  # dispatchers and by-hand lanes have no cadence: a quiet week is not a fault
+        r = db.execute("select max(started) from lane_runs where lane = ? and status = 'ok'", (lane,)).fetchone()[0]
+        last = parse_ts(r) if r else None
+        if last is None or (at or now()) - last > dt.timedelta(days=days):
+            out.append((lane, days, last))
+    return out
+
+
+def seat_minutes(db, cfg=None, at=None):
+    """[(seat, headless minutes in 7 days, soft weekly budget or 0)]"""
+    cfg = cfg or config()
+    since = stamp((at or now()) - dt.timedelta(days=7))
+    return [(r["seat"], int(r["m"] or 0), int(cfg["seats"].get(r["seat"], {}).get("weekly_budget_min", 0)))
+            for r in db.execute("select seat, round(sum(duration_s) / 60.0) m from lane_runs where started >= ? "
+                                "group by seat order by seat", (since,))]
+
+
+# ---------------------------------------------------------------- inbox
+def deliver(db, lane, kind, target, **data):
+    """Insert or update the row for one path or url. Returns (id, 'added' | 'updated')."""
+    if not re.fullmatch(r"[a-z0-9-]+", lane):
+        raise ValueError("lane is lowercase letters, digits and hyphens")
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+    if data.get("needs") and data["needs"] not in NEEDS:
+        raise ValueError(f"needs must be one of {', '.join(NEEDS)}")
+    if data.get("expires") and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data["expires"]):
+        raise ValueError("expires must be YYYY-MM-DD")
+    if data.get("decision"):
+        data["decision"] = f"D-{ident(data['decision'])}"
+    if re.match(r"https?://", target):
+        key, data["url"] = "url", target
+    else:
+        p = os.path.realpath(os.path.expanduser(target))
+        if not os.path.isfile(p):
+            raise ValueError(f"not a file: {target}")
+        key, data["path"] = "path", tilde(p)
+    data.update(lane=lane, kind=kind, updated_at=stamp())
+    row = db.execute(f"select id from deliverables where {key} = ?", (data[key],)).fetchone()
+    if row:  # registered before: change only what the caller passed (the title and date stay)
+        data.setdefault("status", "unread")  # a regenerated file is new reading
+        db.execute(f"update deliverables set {', '.join(k + ' = ?' for k in data)} where id = ?",
+                   [*data.values(), row["id"]])
+        db.commit()
+        return row["id"], "updated"
+    data.setdefault("title", os.path.basename(target))
+    data.setdefault("date", now().date().isoformat())
+    data.setdefault("needs", NEEDS_BY_KIND[kind])
+    data.setdefault("created_at", data["updated_at"])
+    cols = list(data)
+    cur = db.execute(f"insert into deliverables ({', '.join(cols)}) values ({', '.join('?' * len(cols))})",
+                     [data[k] for k in cols])
+    db.commit()
+    return cur.lastrowid, "added"
+
+
+def section(r):
+    """Where an unread row sits in the inbox. A row tied to a decision sits with the decision:
+    that is where the choice gets made, the row is its material."""
+    if r["needs"] == "parked":
+        return "parked"
+    return "decision" if r["decision"] else r["needs"]
+
+
+def needs_you(db):
+    rows = db.execute("select * from deliverables where status = 'unread' order by date desc, id desc").fetchall()
+    return [r for r in rows if section(r) == "act"]
+
+
+def sweep(db, today=None):
+    """Unread rows that no longer need a human, by rule: its decision is closed -> superseded;
+    past its expires date -> read; fyi older than FYI_DAYS -> read. Never touches an act row
+    that stands alone. Returns [(id, new status, why, title)]."""
+    today = today or now().date()
+    closed = {f"D-{r['id']}" for r in db.execute("select id from decisions where state in ('done', 'declined')")}
+    out = []
+    for r in db.execute("select * from deliverables where status = 'unread'").fetchall():
+        if r["decision"] in closed:
+            out.append((r["id"], "superseded", f"{r['decision']} is closed", r["title"]))
+        elif r["expires"] and r["expires"] < today.isoformat():
+            out.append((r["id"], "read", f"expired {r['expires']}", r["title"]))
+        elif r["needs"] == "fyi" and not r["decision"] and r["date"] <= (today - dt.timedelta(days=FYI_DAYS)).isoformat():
+            out.append((r["id"], "read", f"fyi from {r['date']}", r["title"]))
+    return out
+
+
+def set_status(db, rid, status):
+    db.execute("update deliverables set status = ?, updated_at = ? where id = ?", (status, stamp(), rid))
+    db.commit()
+
+
+def stray_files(db, cfg=None, at=None):
+    """Files under the inbox roots, newer than SCAN_DAYS, that no deliverables row points at."""
+    known = {os.path.expanduser(r["path"]) for r in db.execute("select path from deliverables where path != ''")}
+    cutoff = ((at or now()) - dt.timedelta(days=SCAN_DAYS)).timestamp()
+    out = []
+    for root in (cfg or config())["inbox"].get("roots", []):
+        for p in glob.glob(os.path.join(os.path.expanduser(root), "**", "*"), recursive=True):
+            if os.path.isfile(p) and not os.path.basename(p).startswith((".", "_")) \
+                    and os.path.getmtime(p) >= cutoff and os.path.realpath(p) not in known:
+                out.append(p)
+    return sorted(out)
+
+
+# ---------------------------------------------------------------- lint
+def lint(db, at=None):
+    """Hygiene findings as [(severity, line)]. Cheap and local; nothing here calls out."""
+    cfg, out = config(), []
+    for lane in (None, *sorted(cfg["lanes"])):
+        if stop_file(lane) and (lane is None or not stop_file()):
+            out.append(("warn", f"kill switch is on for {lane or 'every lane'}: {tilde(stop_file(lane))} (delete it to resume)"))
+    for lane, days, last in past_cadence(db, cfg, at):
+        out.append(("warn", f"lane {lane}: never run (cadence {days}d)" if last is None else
+                    f"lane {lane}: last ok run {last.date()} is past its {days}-day cadence"))
+    for r in open_failures(db, at=at):
+        out.append(("warn", f"lane {r['lane']} on {r['seat']} ended {r['status']} at {r['started'][:16]} ({r['log']})"))
+    for seat, minutes, budget in seat_minutes(db, cfg, at):
+        out.append(("warn" if budget and minutes > budget else "info",
+                    f"seat {seat}: {minutes} headless minutes in 7 days (soft budget {budget or 'not set'})"))
+    gone = [r["id"] for r in db.execute("select id, path from deliverables where path != '' and status != 'superseded'")
+            if not os.path.exists(os.path.expanduser(r["path"]))]
+    if gone:
+        out.append(("warn", f"inbox: {len(gone)} row(s) point at a file that no longer exists: "
+                            + ", ".join(f"#{i}" for i in gone[:8])))
+    stray = stray_files(db, cfg, at)
+    if stray:
+        out.append(("warn", f"inbox: {len(stray)} file(s) from the last {SCAN_DAYS} days have no row "
+                            f"(first: {tilde(stray[0])}); register with `lanes deliver`"))
+    return out
+
+
+# ---------------------------------------------------------------- decision queue
+def ident(s):
+    m = re.fullmatch(r"(?:D-)?(\d+)", str(s).strip(), re.I)
+    if not m:
+        raise ValueError(f"not a decision id: {s}")
+    return int(m.group(1))
+
+
+def get_decision(db, did):
+    r = db.execute("select * from decisions where id = ?", (ident(did),)).fetchone()
+    if not r:
+        raise ValueError(f"no decision D-{ident(did)}")
+    return r
+
+
+def add_decision(db, label, title, body=""):
+    """File a decision. An agent files one only when it needs a human, with the consequence of
+    approving spelled out in the body."""
+    t = stamp(fine=True)
+    cur = db.execute("insert into decisions (label, title, body, created_at, updated_at) values (?, ?, ?, ?, ?)",
+                     (label, title, body, t, t))
+    db.commit()
+    mirror(db, cur.lastrowid, "add")
+    return cur.lastrowid
+
+
+def add_comment(db, did, body, author="human"):
+    d = get_decision(db, did)
+    t = stamp(fine=True)
+    db.execute("insert into decision_comments (decision_id, author, body, created_at) values (?, ?, ?, ?)",
+               (d["id"], author, body, t))
+    db.execute("update decisions set updated_at = ? where id = ?", (t, d["id"]))
+    db.commit()
+    mirror(db, d["id"], "comment", body)
+
+
+def move(db, did, action, comment="", author="human"):
+    """Apply one move from MOVES. Raises ValueError when the decision is not in a state that
+    allows it (a closed decision cannot be approved; reopen it first)."""
+    d = get_decision(db, did)
+    allowed, new = MOVES[action]
+    if d["state"] not in allowed:
+        raise ValueError(f"D-{d['id']} is {d['state']}; {action} needs {' or '.join(allowed)}")
+    if comment:
+        add_comment(db, d["id"], comment, author)
+    t = stamp(fine=True)
+    db.execute("update decisions set state = ?, updated_at = ?, approved_at = ? where id = ?",
+               (new, t, t if action == "approve" else d["approved_at"], d["id"]))
+    db.commit()
+    mirror(db, d["id"], "state")
+    return new
+
+
+def dispatch_ready(db, label=None, quiet_min=QUIET_MIN, at=None):
+    """Approved decisions a dispatcher lane should work now. A decision in_progress is ready unless
+    an agent commented within `quiet_min` minutes (a run is on it), or the newest comment is an
+    agent's answer without [continuing] and the human has not approved again since."""
+    out = []
+    for d in db.execute("select * from decisions where state = 'in_progress' order by approved_at, id").fetchall():
+        if label and d["label"] != label:
+            continue
+        last = db.execute("select * from decision_comments where decision_id = ? order by id desc limit 1",
+                          (d["id"],)).fetchone()
+        if last and last["author"] == "agent":
+            if (at or now()) - parse_ts(last["created_at"]) < dt.timedelta(minutes=quiet_min):
+                continue
+            if CONTINUING not in last["body"] and d["approved_at"] <= last["created_at"]:
+                continue
+        out.append(d)
+    return out
+
+
+# ---------------------------------------------------------------- optional Linear mirror
+def linear_gql(query, variables=None):
+    req = urllib.request.Request("https://api.linear.app/graphql",
+                                 data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+                                 headers={"Authorization": os.environ["LINEAR_API_KEY"], "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.load(r)
+    if data.get("errors"):
+        raise RuntimeError(data["errors"][0].get("message", "Linear error"))
+    return data["data"]
+
+
+def linear_team():
+    t = linear_gql("query($k: String!) { teams(filter: {key: {eq: $k}}) { nodes { id states { nodes { id name } } } } }",
+                   {"k": os.environ["LINEAR_TEAM"]})["teams"]["nodes"][0]
+    return t["id"], {s["name"]: s["id"] for s in t["states"]["nodes"]}
+
+
+def mirror(db, did, what, body=""):
+    """Copy a local change to Linear when LINEAR_API_KEY and LINEAR_TEAM are set. The local table
+    stays the source of truth: a mirror failure prints a warning and changes nothing here."""
+    if not (os.environ.get("LINEAR_API_KEY") and os.environ.get("LINEAR_TEAM")):
+        return
+    try:
+        d = get_decision(db, did)
+        team, states = linear_team()
+        if not d["external_id"]:  # first contact: create the issue in the decision's current state
+            i = linear_gql("mutation($i: IssueCreateInput!) { issueCreate(input: $i) { issue { id url } } }",
+                           {"i": {"teamId": team, "title": f"[{d['label']}] {d['title']}", "description": d["body"],
+                                  "stateId": states[LINEAR_STATE[d["state"]]]}})["issueCreate"]["issue"]
+            db.execute("update decisions set external_id = ?, external_url = ? where id = ?", (i["id"], i["url"], d["id"]))
+            db.commit()
+            d = get_decision(db, did)
+            if what != "comment":
+                return
+        if what == "state":
+            linear_gql("mutation($id: String!, $s: String!) { issueUpdate(id: $id, input: {stateId: $s}) { success } }",
+                       {"id": d["external_id"], "s": states[LINEAR_STATE[d["state"]]]})
+        elif what == "comment":
+            linear_gql("mutation($i: CommentCreateInput!) { commentCreate(input: $i) { success } }",
+                       {"i": {"issueId": d["external_id"], "body": body}})
+    except Exception as e:  # network, auth, a renamed workflow state
+        print(f"lanes: Linear mirror skipped for D-{did} ({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def pull(db):
+    """Copy states the human changed in Linear back into the local table. Returns [(id, state)]."""
+    rows = db.execute("select * from decisions where external_id != '' and state in ('todo', 'in_progress')").fetchall()
+    if not rows:
+        return []
+    q = "{ " + " ".join(f'i{r["id"]}: issue(id: "{r["external_id"]}") {{ state {{ name }} }}' for r in rows) + " }"
+    names = {v: k for k, v in LINEAR_STATE.items()}
+    changed = []
+    for key, issue in linear_gql(q).items():
+        did, new = int(key[1:]), names.get(((issue or {}).get("state") or {}).get("name"))
+        old = get_decision(db, did)["state"]
+        if new and new != old:
+            t = stamp(fine=True)
+            db.execute("update decisions set state = ?, updated_at = ?, approved_at = case when ? = 'in_progress' "
+                       "then ? else approved_at end where id = ?", (new, t, new, t, did))
+            changed.append((did, new))
+    db.commit()
+    return changed
+
+
+# ---------------------------------------------------------------- demo seed (everything invented)
+def tiny_pdf(lines):
+    """A one-page PDF from plain lines, by hand, so the demo needs no PDF library."""
+    text = "BT /F1 14 Tf 72 720 Td 20 TL " + " ".join(
+        "(" + ln.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)") + ") Tj T*" for ln in lines) + " ET"
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+            "/Resources << /Font << /F1 5 0 R >> >> >>",
+            f"<< /Length {len(text)} >>\nstream\n{text}\nendstream",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = "%PDF-1.4\n", []
+    for n, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{n} 0 obj\n{o}\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n" + "".join(f"{o:010d} 00000 n \n" for o in offsets)
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+    return out.encode("latin-1")
+
+
+DEMO_TOML = """# Demo config. Every lane, seat and number here is invented.
+[seats.main]
+weekly_budget_min = 240
+
+[seats.outreach]
+weekly_budget_min = 120
+
+[lanes.weekly-digest]
+seat = "main"
+cadence_days = 8
+schedule = "Mon 06:00"
+
+[lanes.repo-lint]
+seat = "main"
+cadence_days = 2
+schedule = "daily 23:00"
+
+[lanes.dispatcher]
+seat = "main"
+schedule = "daily 07:30, only when approved work waits"
+
+[lanes.pipeline-source]
+seat = "outreach"
+cadence_days = 16
+schedule = "1st and 3rd Thu 08:30"
+
+[lanes.pipeline-strike]
+seat = "outreach"
+schedule = "by hand, after a pick"
+
+[lanes.pipeline-followup]
+seat = "outreach"
+cadence_days = 5
+schedule = "Tue, Fri 08:00"
+
+[inbox]
+roots = ["{out}"]
+"""
+
+
+def seed_demo(root):
+    """Fill the database and `root` with about 60 runs, 14 inbox rows and 6 decisions. Uses
+    whatever LANES_DB / LANES_DIR / LANES_LOG_DIR point at; the console's --demo aims them at a
+    temp folder first. All of it is made up."""
+    root = os.path.realpath(root)
+    for p in (db_path(), lanes_dir(), log_dir()):
+        if not os.path.realpath(p).startswith(root + os.sep):  # never the real database or the real lanes.toml
+            raise ValueError(f"seed-demo only writes inside {root}, and {p} is outside it")
+    out, ldir = os.path.join(root, "outbox"), lanes_dir()
+    for d in (out, ldir, log_dir()):
+        os.makedirs(d, exist_ok=True)
+    db = connect()
+    if db.execute("select count(*) from lane_runs").fetchone()[0]:
+        raise ValueError(f"{db_path()} already has runs; seed-demo only fills an empty database")
+    with open(os.path.join(ldir, "lanes.toml"), "w") as f:
+        f.write(DEMO_TOML.format(out=out))
+    t0 = now().replace(minute=0, second=0, microsecond=0)
+    day = dt.timedelta(days=1)
+
+    def ago(days, hour, minute=0):
+        return (t0 - days * day).replace(hour=hour, minute=minute)
+
+    def run(seat, lane, start, secs, turns, status="ok", summary="", text=""):
+        logp = os.path.join(log_dir(), seat, f"{lane}-{start:%Y%m%d-%H%M%S}.log")
+        os.makedirs(os.path.dirname(logp), exist_ok=True)
+        end = start + dt.timedelta(seconds=secs)
+        with open(logp, "w") as f:
+            f.write(f"lane-run: {seat}/{lane}\n{text}\n==== result: {status}, {stamp(start)} .. {stamp(end)} ====\n{summary}\n")
+        db.execute("insert into lane_runs (seat, lane, started, ended, duration_s, turns, cost_usd, input_tokens, "
+                   "output_tokens, status, session_id, log, summary) values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (seat, lane, stamp(start), stamp(end), secs, turns, 0, turns * 21000, turns * 900, status,
+                    f"demo-{lane}-{start:%m%d%H%M}", tilde(logp), summary))
+        return logp
+
+    # weekly-digest: Mondays. One timed out three weeks back and the next week recovered.
+    monday = (t0 - dt.timedelta(days=t0.weekday())).replace(hour=6, minute=4)
+    if monday > t0:  # early on a Monday: this week's run has not happened yet
+        monday -= 7 * day
+    mondays = [monday - 7 * i * day for i in range(5)]
+    for i, m in enumerate(mondays):
+        if i == 3:
+            run("main", "weekly-digest", m, 3300, 200, "timeout", "", "analytics API: 429, backing off (attempt 9)")
+        else:
+            run("main", "weekly-digest", m, 412 + 31 * i, 24 + i,
+                summary=f"Digest written and registered. One decision filed: the pricing page ({i + 2} lines).")
+    # repo-lint: nightly, 30 days.
+    for i in range(1, 31):
+        n = (i * 7) % 4
+        run("main", "repo-lint", ago(i, 23, 2), 95 + (i * 13) % 60, 9 + i % 5,
+            summary="Clean. No issue filed." if n else "2 stale branches, 1 TODO older than 90 days. Report registered; no decision needed.")
+    # dispatcher: fires only when dispatch-check finds approved work.
+    for i, d in enumerate((2, 5, 6, 9, 12, 15, 19, 22, 26)):
+        run("main", "dispatcher", ago(d, 7, 31), 540 + 80 * (i % 4), 38 + 6 * (i % 3),
+            summary=f"D-{3 if i == 0 else 5} -> {'todo: draft is in the inbox, the send is yours' if i == 0 else 'done'}")
+    # the pipeline: source (fortnightly, now past cadence), strike (after a pick), follow-up (Tue, Fri).
+    run("outreach", "pipeline-source", ago(19, 8, 33), 780, 61, summary="7 keepers of 15 candidates. Pick list filed as D-1.")
+    run("outreach", "pipeline-source", ago(33, 8, 31), 705, 55, summary="6 keepers of 13 candidates. Pick list filed.")
+    run("outreach", "pipeline-strike", ago(17, 10, 12), 420, 33, summary="Picks 1 3 4 6: four drafts in the mail client, batch file registered, pick list handed back.")
+    run("outreach", "pipeline-strike", ago(31, 14, 40), 388, 29, summary="Picks 2 5: two drafts, batch file registered.")
+    for i, d in enumerate((1, 4, 8, 11, 15, 18, 22, 25)):
+        if i == 0:
+            fail_log = run("outreach", "pipeline-followup", ago(d, 8, 3), 41, 3, "error",
+                           "Mail connector not authorized on this seat. No drafts created; nothing changed.",
+                           "mail connector: not authorized in headless mode on this seat\n"
+                           "fallback: follow-up drafts written into the report as paste-ready text")
+        else:
+            run("outreach", "pipeline-followup", ago(d, 8, 2), 260 + 20 * i, 21 + i,
+                summary=f"{i % 3} follow-up draft(s), {i % 2} reply noticed, {1 if i == 5 else 0} closed at day 21.")
+
+    # files the lanes left behind
+    def write(name, text, mode="w"):
+        p = os.path.join(out, name)
+        with open(p, mode) as f:
+            f.write(text)
+        return p
+
+    this_mon, last_mon = mondays[0].date(), mondays[1].date()
+    digest = write(f"{this_mon}-weekly-digest.md", f"""# Weekly digest, {this_mon}
+
+| Surface | Sessions | vs last week |
+|---|---|---|
+| Home | 412 | +6% |
+| Pricing | 96 | **-34%** |
+| Docs | 240 | +2% |
+
+## The one thing
+
+The pricing page lost a third of its visits after the nav change on Tuesday. The link moved
+from the header into the footer.
+
+## What I did not do
+
+Nothing was changed on the site. A rewrite draft waits on D-2.
+""")
+    old_digest = write(f"{last_mon}-weekly-digest.md", f"# Weekly digest, {last_mon}\n\nFlat week. No decision needed.\n")
+    prospects = write("prospects.md", """# Partner prospects: 7 keepers of 15
+
+1. **Spoke and Ledger** (newsletter, 8k readers). Signal: asked readers last month what they use for repair tickets.
+2. **Two Wheels Weekly** (newsletter, 22k). Signal: runs a "tools we use" column.
+3. **Shop Floor Notes** (podcast). Signal: episode 41 was about lost repair tags.
+4. **The Service Stand** (consultant). Signal: sells a shop-setup course, refers tools out.
+5. **Bench Notes** (blog). Signal: comparison post from 2023 is out of date.
+6. **Counter Culture Cycles** (community, 3k members). Signal: pinned thread on software.
+7. **Truing Stand Review** (newsletter, 5k). Signal: accepts partner links, says so in the footer.
+
+Reply on D-1 with the numbers to pitch. Nothing is drafted until you pick.
+""")
+    batch = write("batch-3.md", """# Partner pitches, batch 3
+
+Four drafts are sitting in the mail client. Nothing was sent.
+
+## 1. Spoke and Ledger
+**To:** editor@spokeandledger.example
+**Subject:** Repair tickets, and a cut for your readers
+
+You asked your readers what they use for repair tickets. Most answers were a paper tag.
+We built the app for that, and every shop that signs up through you pays you 20%.
+
+## 3. Shop Floor Notes
+**To:** hello@shopfloornotes.example
+**Subject:** Episode 41 and the lost-tag problem
+
+(three more in this file)
+""")
+    batch2 = write("batch-2.md", "# Partner pitches, batch 2\n\nTwo drafts. Both were sent.\n")
+    followups = write("followups.md", """# Follow-ups
+
+| Partner | Status | Last touch | Action |
+|---|---|---|---|
+| Two Wheels Weekly | contacted | 5 days | follow-up 1 drafted |
+| Bench Notes | contacted | 11 days | follow-up 2 drafted |
+| The Service Stand | **replied** | 1 day | nothing drafted; the reply is yours |
+| Truing Stand Review | dead | 22 days | closed after two follow-ups |
+""")
+    rewrite = write("pricing-rewrite.md", """# Pricing page: rewrite draft
+
+**Headline:** One price per shop. No per-seat math.
+
+**Sub:** Every mechanic, every bench, one flat monthly fee.
+
+Three changes from the live page: the price sits above the fold, the comparison table is
+gone, and the header link is back.
+
+Approving D-2 opens a PR with this copy. Merging is yours.
+""")
+    guide = write("new-seat-guide.html", """<!doctype html><meta charset=utf-8><title>Adding a seat</title>
+<body style="font:16px/1.6 system-ui;max-width:640px;margin:32px auto;padding:0 16px">
+<h1>Adding a seat</h1>
+<ol><li>Pick a config directory: <code>~/.claude-outreach</code>.</li>
+<li>Log in once, interactively: <code>CLAUDE_CONFIG_DIR=~/.claude-outreach claude</code>, then <code>/login</code>.</li>
+<li>Authorize only the connectors this seat's lanes need.</li>
+<li>Run one lane in the foreground and read the log before enabling its timer.</li></ol>
+<p>A seat is a blast radius. Keep its mailbox and its permissions as small as its job.</p></body>
+""")
+    onepager = write("partner-one-pager.pdf", tiny_pdf(
+        ["Partner one-pager (demo)", "", "What it is: a repair-ticket app for bike shops.",
+         "What you get: 20% of every shop that signs up through your link.", "Cookie: 90 days.",
+         "", "This PDF was written by hand in seed-demo. It is not a real offer."]), "wb")
+    checklist = write("launch-checklist.md", "# Launch checklist\n\nParked until the pricing decision (D-2) lands.\n\n- [ ] announcement email\n- [ ] changelog entry\n- [ ] partner note\n")
+    lint_report = write("lint.md", "# lanes lint\n\n```\nWARN  lane pipeline-source: last ok run is past its 16-day cadence\n```\n")
+    onboarding = write("onboarding-email-v2.md", """# Onboarding email, draft v2
+
+**Subject:** Your first repair ticket takes about a minute
+
+Hi {first_name},
+
+Open the app, tap New ticket, and scan the tag on the bike. That is the whole setup.
+
+If you get stuck, reply to this email. A person reads it.
+""")
+
+    # decisions
+    def decision(label, title, body, state, created, approved=None, comments=()):
+        t = stamp(created, fine=True)
+        cur = db.execute("insert into decisions (label, title, body, state, created_at, updated_at, approved_at) "
+                         "values (?,?,?,?,?,?,?)", (label, title, body, state, t, t, stamp(approved, fine=True) if approved else ""))
+        for author, text, when in comments:
+            db.execute("insert into decision_comments (decision_id, author, body, created_at) values (?,?,?,?)",
+                       (cur.lastrowid, author, text, stamp(when, fine=True)))
+        return cur.lastrowid
+
+    d1 = decision("outreach", "Partner prospects: 7 to pick from",
+                  "The source lane found 7 keepers (file in the inbox).\n\n**What approval means:** comment the numbers "
+                  "to pitch, then approve. `pipeline-strike` turns each pick into a mail draft. Nothing is sent.",
+                  "todo", ago(19, 8, 47))
+    d2 = decision("product", "Weekly digest: the pricing page lost a third of its visits. Approve a rewrite?",
+                  "Pricing sessions fell 34% after the nav change.\n\n**What approval means:** the dispatcher opens a "
+                  "branch and a PR with the draft copy. The merge stays yours.", "todo", mondays[0] + dt.timedelta(minutes=9))
+    d3 = decision("product", "Onboarding email: approve a second draft",
+                  "Open rate on the first onboarding email is flat.\n\n**What approval means:** a new draft in the inbox. "
+                  "The send stays yours.", "todo", ago(4, 9), ago(3, 18),
+                  [("human", "Shorter. One step, not five.", ago(3, 18)),
+                   ("agent", "**Dispatch (main, " + f"{ago(2, 7, 40):%Y-%m-%d %H:%M}" + ")** Draft v2 is in the inbox. "
+                    "One step, 60 words. Next: you send it from the mail tool, or comment and approve again.", ago(2, 7, 40))])
+    d4 = decision("product", "Changelog page: approve a branch and a PR",
+                  "Three partners asked what changed last month.\n\n**What approval means:** the dispatcher writes "
+                  "`/changelog` on a branch and opens a PR. No merge, no deploy.", "in_progress", ago(1, 16), t0 - dt.timedelta(hours=2))
+    decision("ops", "Archive run logs older than 90 days", "**What approval means:** logs move to a dated archive folder. Nothing is deleted.",
+             "done", ago(12, 9), ago(10, 12),
+             [("agent", f"**Dispatch (main, {ago(9, 7, 38):%Y-%m-%d %H:%M})** Moved 212 logs. Nothing deleted.", ago(9, 7, 38))])
+    decision("outreach", "Add a third follow-up touch", "Two partners replied after the second follow-up.",
+             "declined", ago(8, 9), None, [("human", "No. Two touches, then closed.", ago(7, 20))])
+
+    # inbox rows
+    def row(lane, kind, target, title, days, status="unread", **kw):
+        rid, _ = deliver(db, lane, kind, target, title=title, date=(t0 - days * day).date().isoformat(), **kw)
+        if status != "unread":
+            db.execute("update deliverables set status = ? where id = ?", (status, rid))
+
+    row("outreach", "batch", batch, "Partner pitches, batch 3: 4 drafts ready to send", 0)
+    row("ops", "report", fail_log, "Lane failed: pipeline-followup (error)", 1, needs="act", source="lane-run")
+    row("outreach", "prospects", prospects, "Partner prospects: 7 keepers", 19, decision=d1)
+    row("product", "draft", rewrite, "Pricing page rewrite: draft copy", 0, decision=d2)
+    row("product", "draft", onboarding, "Onboarding email, draft v2", 2, decision=d3)
+    row("product", "draft", "https://example.com/acme/app/pull/14", "PR #14: changelog page (branch only)", 0, decision=d4)
+    row("ops", "guide", guide, "Adding a seat: the four steps", 6)
+    row("outreach", "other", onepager, "Partner one-pager (PDF)", 5, needs="read")
+    row("product", "digest", digest, f"Weekly digest {this_mon}", (t0.date() - this_mon).days)
+    row("outreach", "report", followups, "Follow-ups: 2 drafts, 1 reply, 1 closed", 1)
+    row("product", "draft", checklist, "Launch checklist", 3, needs="parked")
+    row("product", "digest", old_digest, f"Weekly digest {last_mon}", (t0.date() - last_mon).days, status="read")
+    row("ops", "report", lint_report, "Lint: 1 warning", 2, status="read")
+    row("outreach", "batch", batch2, "Partner pitches, batch 2", 17, status="acted")
+    db.commit()
+    return db
+
+
+# ---------------------------------------------------------------- CLI
+def cmd_log_run(a):
+    db = connect()
+    rid, st = log_run(db, a.seat, a.lane, a.status, a.started or stamp(), a.ended or "", a.json, a.log, a.no_summary)
+    r = db.execute("select * from lane_runs where id = ?", (rid,)).fetchone()
+    print(f"lane_runs #{rid}: {a.seat}/{a.lane} {st} {r['duration_s']}s {r['turns'] or '?'} turns", file=sys.stderr)
+    print(st)  # stdout is the final status alone, for the runner
+    return 0
+
+
+def cmd_runs(a):
+    for r in connect().execute("select * from lane_runs order by started desc limit ?", (a.n,)):
+        print(f"{r['started'][:16]}  {r['seat']:<10} {r['lane']:<20} {r['status']:<8} {r['duration_s'] or 0:>5}s  "
+              f"{(r['summary'] or '').splitlines()[0][:70] if r['summary'] else ''}")
+    return 0
+
+
+def cmd_deliver(a):
+    data = dict(p.split("=", 1) for p in a.pairs if "=" in p)
+    bad = set(data) - {"title", "needs", "decision", "expires", "source", "note", "date"}
+    if bad or len(data) != len(a.pairs):
+        sys.exit(f"lanes deliver: expected key=value pairs (title, needs, decision, expires, source, note); got {a.pairs}")
+    rid, what = deliver(connect(), a.lane, a.kind, a.target, **data)
+    print(f"{what} inbox #{rid}: [{a.lane}/{a.kind}] {data.get('title', os.path.basename(a.target))}")
+    return 0
+
+
+def cmd_sweep(a):
+    db = connect()
+    rows = sweep(db)
+    for rid, status, why, title in rows:
+        print(f"#{rid} -> {status}: {why}  ({title})")
+        if not a.dry_run:
+            set_status(db, rid, status)
+    print(f"inbox-sweep: {len(rows)} row(s) {'would be ' if a.dry_run else ''}cleared")
+    return 0
+
+
+def cmd_lint(a):
+    rows = lint(connect())
+    if a.digest:
+        rows = [r for r in rows if r[0] == "warn"]
+        if rows:
+            print(f"Lint: {len(rows)} warning(s).")
+    elif not rows:
+        print("lint: clean")
+    for sev, line in rows:
+        print(f"  {line}" if a.digest else f"{'WARN' if sev == 'warn' else 'info'}  {line}")
+    return 1 if any(s == "warn" for s, _ in rows) else 0
+
+
+def cmd_nightly(a):
+    """What the nightly timer runs. No Claude seat: plain Python on the database."""
+    db = connect()
+    for rid, status, _why, _title in sweep(db):
+        set_status(db, rid, status)
+    warns = [line for sev, line in lint(db) if sev == "warn"]
+    if not warns:
+        print("nightly: clean")
+        return 0
+    p = os.path.join(log_dir(), "lint", "latest.md")  # one file, so one inbox row, however many nights it warns
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(f"# lanes lint {now():%Y-%m-%d %H:%M}\n\n" + "".join(f"- {w}\n" for w in warns))
+    deliver(db, "ops", "report", p, title=f"Lint: {len(warns)} warning(s), {now():%Y-%m-%d}", needs="act", source="nightly")
+    print(f"nightly: {len(warns)} warning(s) -> {p}")
+    return 0
+
+
+def cmd_failed(a):
+    """`OnFailure=lane-failed@%n.service` lands here with the unit name. The runner registers its own
+    failures; this catches a unit that died before the runner could (a bad ExecCondition, a
+    systemd timeout). Registering the same log twice updates one row. Never fails itself."""
+    lane = re.sub(r"^lane-|\.service$", "", a.unit)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", lane):
+        print(f"lanes failed: not a lane unit: {a.unit}", file=sys.stderr)
+        return 0
+    name = re.compile(re.escape(lane) + r"-\d{8}-\d{6}\.log")   # this lane's logs, not pipeline-* for pipeline
+    recent = now().timestamp() - 15 * 60                           # and only a log from this failure
+    logs = [p for p in glob.glob(os.path.join(log_dir(), "*", f"{lane}-*.log"))
+            if name.fullmatch(os.path.basename(p)) and os.path.getmtime(p) >= recent]
+    if logs:
+        target = max(logs, key=os.path.getmtime)
+    else:  # the unit died before the runner wrote anything: leave a note that says where to look
+        target = os.path.join(log_dir(), "unit-failures", f"{lane}-{now():%Y%m%d-%H%M%S}.log")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w") as f:
+            f.write(f"The unit for lane {lane} failed and the runner left no log in the last 15 minutes.\n"
+                    f"Look at: journalctl --user -u lane-{lane} -n 40\n")
+    rid, what = deliver(connect(), "ops", "report", target, title=f"Lane failed: {lane} ({now():%Y-%m-%d %H:%M})",
+                        needs="act", source="lane-failed")
+    print(f"{what} inbox #{rid}")
+    return 0
+
+
+def cmd_queue(a):
+    db = connect()
+    if a.action == "add":
+        body = open(a.body_file).read() if a.body_file else (a.body or "")
+        print(f"D-{add_decision(db, a.label, a.title, body)}")
+    elif a.action == "list":
+        where, args = ["1 = 1"], []
+        if a.state:
+            where.append("state = ?"), args.append(a.state)
+        if a.label:
+            where.append("label = ?"), args.append(a.label)
+        for d in db.execute(f"select * from decisions where {' and '.join(where)} order by id", args):
+            print(f"D-{d['id']}\t{d['state']}\t[{d['label']}] {d['title']}")
+    elif a.action == "show":
+        d = get_decision(db, a.id)
+        print(f"D-{d['id']} [{d['label']}] {d['title']}\nstate: {d['state']}\n\n{d['body']}")
+        for c in db.execute("select * from decision_comments where decision_id = ? order by id", (d["id"],)):
+            print(f"\n-- {c['author']}, {c['created_at'][:16]}\n{c['body']}")
+    elif a.action == "comment":
+        add_comment(db, a.id, a.text, a.author)
+        print(f"commented on D-{ident(a.id)}")
+    elif a.action == "pull":
+        if not os.environ.get("LINEAR_API_KEY"):
+            sys.exit("lanes queue pull: LINEAR_API_KEY is not set; the local table is the queue")
+        try:
+            changed = pull(db)
+        except Exception as e:  # network, auth, an issue deleted on the other side
+            sys.exit(f"lanes queue pull: {type(e).__name__}: {e}")
+        for did, state in changed:
+            print(f"D-{did} -> {state}")
+    else:
+        print(f"D-{ident(a.id)} -> {move(db, a.id, a.action, a.comment or '', a.author)}")
+    return 0
+
+
+def cmd_dispatch_check(a):
+    """Exit 0 and list the work, or exit 1 with nothing printed. A dispatcher unit uses this as
+    ExecCondition=, so an empty queue wakes no seat and writes no run row. Anything broken (no
+    database, a bad lanes.toml) exits 255: systemd skips the unit on 1 to 254 and fails it on
+    255, so a broken setup can't pass for an empty queue."""
+    try:
+        config()
+        db = connect()
+        if os.environ.get("LINEAR_API_KEY") and os.environ.get("LINEAR_TEAM"):
+            try:
+                pull(db)
+            except Exception as e:  # Linear down: work from the local table rather than wake a seat blind
+                print(f"dispatch-check: Linear unreachable ({e}); using local states", file=sys.stderr)
+        rows = dispatch_ready(db, a.label, int(os.environ.get("LANE_DISPATCH_QUIET_MIN", QUIET_MIN)))
+    except (Exception, SystemExit) as e:
+        print(f"dispatch-check: {type(e).__name__}: {e}", file=sys.stderr)
+        return 255
+    for d in rows:
+        print(f"D-{d['id']}\t[{d['label']}] {d['title']}")
+    return 0 if rows else 1
+
+
+def cmd_stopped(a):
+    path = stop_file(a.lane)
+    if path:
+        print(path)
+    return 0 if path else 1
+
+
+def cmd_seed_demo(a):
+    root = os.path.realpath(a.dir)
+    os.environ.update(LANES_DB=os.path.join(root, "lanes.db"), LANES_DIR=os.path.join(root, "lanes"),
+                      LANES_LOG_DIR=os.path.join(root, "logs"))
+    seed_demo(root).close()
+    print(f"seeded {root}\n  export LANES_DB={os.environ['LANES_DB']} LANES_DIR={os.environ['LANES_DIR']} "
+          f"LANES_LOG_DIR={os.environ['LANES_LOG_DIR']}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="lanes", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init").set_defaults(fn=lambda a: print(f"ready: {db_path()}") if connect() else 1)
+    p = sub.add_parser("log-run")
+    p.add_argument("seat"), p.add_argument("lane")
+    p.add_argument("--status", required=True, choices=("ok", "error", "timeout", "locked"))
+    p.add_argument("--started"), p.add_argument("--ended"), p.add_argument("--json"), p.add_argument("--log")
+    p.add_argument("--no-summary", action="store_true")
+    p.set_defaults(fn=cmd_log_run)
+    p = sub.add_parser("runs")
+    p.add_argument("-n", type=int, default=20)
+    p.set_defaults(fn=cmd_runs)
+    p = sub.add_parser("deliver")
+    p.add_argument("lane"), p.add_argument("kind"), p.add_argument("target"), p.add_argument("pairs", nargs="*")
+    p.set_defaults(fn=cmd_deliver)
+    p = sub.add_parser("inbox-sweep")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_sweep)
+    p = sub.add_parser("lint")
+    p.add_argument("--digest", action="store_true")
+    p.set_defaults(fn=cmd_lint)
+    sub.add_parser("nightly").set_defaults(fn=cmd_nightly)
+    p = sub.add_parser("failed")
+    p.add_argument("unit")
+    p.set_defaults(fn=cmd_failed)
+    q = sub.add_parser("queue").add_subparsers(dest="action", required=True)
+    p = q.add_parser("add")
+    p.add_argument("label"), p.add_argument("title"), p.add_argument("--body"), p.add_argument("--body-file")
+    p = q.add_parser("list")
+    p.add_argument("--state", choices=tuple(LINEAR_STATE)), p.add_argument("--label")
+    q.add_parser("show").add_argument("id")
+    q.add_parser("pull")
+    p = q.add_parser("comment")
+    p.add_argument("id"), p.add_argument("text")
+    p.add_argument("--as", dest="author", default="human", choices=("human", "agent"))
+    for name in MOVES:
+        p = q.add_parser(name)
+        p.add_argument("id"), p.add_argument("--comment")
+        p.add_argument("--as", dest="author", default="human", choices=("human", "agent"))
+    sub.choices["queue"].set_defaults(fn=cmd_queue)
+    p = sub.add_parser("dispatch-check")
+    p.add_argument("label", nargs="?")
+    p.set_defaults(fn=cmd_dispatch_check)
+    p = sub.add_parser("seat-dir")
+    p.add_argument("seat")
+    p.set_defaults(fn=lambda a: print(seat_dir(a.seat)))
+    p = sub.add_parser("stopped")
+    p.add_argument("lane", nargs="?")
+    p.set_defaults(fn=cmd_stopped)
+    p = sub.add_parser("seed-demo")
+    p.add_argument("dir")
+    p.set_defaults(fn=cmd_seed_demo)
+    a = ap.parse_args(argv)
+    try:
+        return a.fn(a) or 0
+    except ValueError as e:
+        sys.exit(f"lanes: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+[Unit]
+Description=Lane: weekly digest (main seat)
+OnFailure=lane-failed@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/headless-lanes/bin/lane-run.sh main weekly-digest
+TimeoutStartSec=95m

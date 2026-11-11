@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the weekly digest every Monday morning
+
+[Timer]
+OnCalendar=Mon 06:00
+# A weekly lane should catch up if the machine was off on Monday.
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

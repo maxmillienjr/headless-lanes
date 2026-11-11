@@ -1,0 +1,8 @@
+[Unit]
+Description=Lane: pipeline source (outreach seat)
+OnFailure=lane-failed@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/headless-lanes/bin/lane-run.sh outreach pipeline-source
+TimeoutStartSec=95m

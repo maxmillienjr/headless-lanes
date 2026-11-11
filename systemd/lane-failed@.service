@@ -1,0 +1,6 @@
+[Unit]
+Description=Put a failed lane run in the inbox (%i)
+
+[Service]
+Type=oneshot
+ExecStart=%h/headless-lanes/bin/lanes failed %i

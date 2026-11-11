@@ -1,0 +1,11 @@
+[Unit]
+Description=Lane: pipeline strike, drafts the picks (outreach seat)
+OnFailure=lane-failed@%n.service
+
+# No timer. Started by hand after a human picks:
+#   LANE_INPUT="D-12: 1 3 4" ~/headless-lanes/bin/lane-run.sh outreach pipeline-strike
+# With no input it reads the picks from the newest approved pick list.
+[Service]
+Type=oneshot
+ExecStart=%h/headless-lanes/bin/lane-run.sh outreach pipeline-strike
+TimeoutStartSec=95m

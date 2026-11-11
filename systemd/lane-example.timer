@@ -1,0 +1,15 @@
+# Template for one lane's schedule. Copy to lane-<name>.timer. Enable the timer, never the
+# service.
+[Unit]
+Description=Run <name> every Monday morning
+
+[Timer]
+OnCalendar=Mon 06:00
+# true: a missed firing runs at the next boot. Right for a daily or weekly lane. Use false
+# for anything that fires every few minutes, or a reboot sets off a burst.
+Persistent=true
+# Two lanes on one seat with the same minute would queue on the seat lock. Spread them.
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

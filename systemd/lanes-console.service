@@ -1,0 +1,9 @@
+[Unit]
+Description=headless-lanes console on 127.0.0.1:8787
+
+[Service]
+ExecStart=/usr/bin/python3 %h/headless-lanes/console/console.py --port 8787
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

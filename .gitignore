@@ -1,0 +1,8 @@
+# local only: the leak-check denylist never gets committed
+.leakcheck
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

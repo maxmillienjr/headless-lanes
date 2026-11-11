@@ -1,0 +1,10 @@
+[Unit]
+Description=Source partners on the 1st and 3rd Thursday
+
+[Timer]
+OnCalendar=Thu *-*-1..7,15..21 08:30
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Follow-ups on Tuesday and Friday
+
+[Timer]
+OnCalendar=Tue,Fri 08:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

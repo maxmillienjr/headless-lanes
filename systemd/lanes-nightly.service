@@ -1,0 +1,6 @@
+[Unit]
+Description=headless-lanes nightly: inbox sweep, then lint (no Claude seat)
+
+[Service]
+Type=oneshot
+ExecStart=%h/headless-lanes/bin/lanes nightly

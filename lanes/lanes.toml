@@ -1,0 +1,32 @@
+# lanes.toml: the seats and lanes this folder runs. The runner, the lint and the console read it.
+#
+# A seat is one Claude Code login with its own config directory. By convention `main` is
+# ~/.claude and any other seat is ~/.claude-<name>; set config_dir to override.
+# weekly_budget_min is a soft cap on headless minutes per 7 days. The lint warns past it.
+
+[seats.main]
+weekly_budget_min = 300
+
+# [seats.outreach]
+# config_dir = "~/.claude-outreach"
+# weekly_budget_min = 120
+
+# A lane is lanes/<name>.md plus this block.
+#   seat          which login runs it
+#   cadence_days  the lint flags the lane when its last ok run is older than this. Leave it
+#                 out for a dispatcher or a by-hand lane: a quiet week is not a fault there.
+#   schedule      shown in the console when no systemd timer is installed. Display only.
+
+# [lanes.weekly-digest]
+# seat = "main"
+# cadence_days = 8
+# schedule = "Mon 06:00"
+
+# [lanes.dispatcher]
+# seat = "main"
+# schedule = "daily 07:30, only when approved work waits"
+
+# Folders where lanes leave files for a human. The lint walks them for files from the last
+# 14 days that no inbox row points at.
+[inbox]
+roots = []
