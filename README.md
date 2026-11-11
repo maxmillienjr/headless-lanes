@@ -14,7 +14,7 @@ is the hard part, and that is what this repo is about.
 ## 30-second demo
 
 ```
-git clone <this repo> && cd headless-lanes
+git clone https://github.com/maxmillienjr/headless-lanes && cd headless-lanes
 python3 console/console.py --demo
 ```
 
