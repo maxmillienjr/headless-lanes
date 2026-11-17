@@ -1,0 +1,10 @@
+# The allowlist for an export: lane name = kind. A lane that is not named here is left out of
+# the export and only counted. A kind is one of: report, pipeline, render, dispatcher, build.
+# These are the demo database's six lanes.
+[kinds]
+weekly-digest = "report"
+repo-lint = "build"
+dispatcher = "dispatcher"
+pipeline-source = "pipeline"
+pipeline-strike = "pipeline"
+pipeline-followup = "pipeline"

@@ -6,3 +6,9 @@ __pycache__/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# week-video: renders and build folders stay local
+examples/week-video/**/*.mp4
+examples/week-video/**/node_modules/
+examples/week-video/**/renders/
+examples/week-video/**/.work/

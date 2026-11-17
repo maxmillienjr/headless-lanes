@@ -1,0 +1,46 @@
+{
+ "format": "lanes-week-export/1",
+ "window": {
+  "start": "2026-05-25T00:00:00",
+  "end": "2026-06-01T00:00:00",
+  "days": 7.0,
+  "seconds": 604800
+ },
+ "seats": [
+  "seat 1",
+  "seat 2"
+ ],
+ "kinds": [
+  "report",
+  "pipeline",
+  "dispatcher",
+  "build"
+ ],
+ "lanes_shown": 4,
+ "runs_left_out": 0,
+ "totals": {
+  "runs": 15,
+  "ok": 13,
+  "failed": 1,
+  "locked": 1,
+  "seconds": 6353,
+  "minutes": 105.9
+ },
+ "runs": [
+  {"seat": "seat 1", "kind": "report", "start_s": 21840, "end_s": 22283, "status": "ok"},
+  {"seat": "seat 1", "kind": "build", "start_s": 82920, "end_s": 83046, "status": "ok"},
+  {"seat": "seat 1", "kind": "dispatcher", "start_s": 113460, "end_s": 114160, "status": "ok"},
+  {"seat": "seat 1", "kind": "build", "start_s": 169320, "end_s": 169433, "status": "ok"},
+  {"seat": "seat 1", "kind": "dispatcher", "start_s": 199860, "end_s": 200480, "status": "ok"},
+  {"seat": "seat 1", "kind": "build", "start_s": 255720, "end_s": 255820, "status": "ok"},
+  {"seat": "seat 2", "kind": "pipeline", "start_s": 288120, "end_s": 288400, "status": "ok"},
+  {"seat": "seat 1", "kind": "build", "start_s": 342120, "end_s": 342267, "status": "ok"},
+  {"seat": "seat 1", "kind": "dispatcher", "start_s": 372660, "end_s": 375540, "status": "ok"},
+  {"seat": "seat 1", "kind": "build", "start_s": 375240, "end_s": 375240, "status": "locked"},
+  {"seat": "seat 1", "kind": "build", "start_s": 428520, "end_s": 428654, "status": "ok"},
+  {"seat": "seat 1", "kind": "dispatcher", "start_s": 459060, "end_s": 459600, "status": "ok"},
+  {"seat": "seat 1", "kind": "build", "start_s": 514920, "end_s": 515041, "status": "ok"},
+  {"seat": "seat 2", "kind": "pipeline", "start_s": 547380, "end_s": 547421, "status": "error"},
+  {"seat": "seat 1", "kind": "build", "start_s": 601320, "end_s": 601428, "status": "ok"}
+ ]
+}
