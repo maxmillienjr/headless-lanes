@@ -11,4 +11,5 @@ __pycache__/
 examples/week-video/**/*.mp4
 examples/week-video/**/node_modules/
 examples/week-video/**/renders/
+examples/week-video/build/
 examples/week-video/**/.work/
