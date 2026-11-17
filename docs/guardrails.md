@@ -4,6 +4,8 @@ Every guardrail here came from something breaking in the system this repo was cu
 kept the failures in, because a guardrail without its failure reads like superstition and gets
 deleted in the next cleanup.
 
+To watch each guardrail catch its failure, run the scripts in [failures/](../failures/README.md).
+
 ## 1. A cloud-drive mount zeroed a file. Twice, same day.
 
 **What happened.** My working files live on a cloud drive mounted over FUSE. In-place
