@@ -35,6 +35,8 @@ def fmt_day(d):
 
 def fmt_range(start, end):
     last = end - dt.timedelta(seconds=1)
+    if start.date() == last.date():
+        return f"{fmt_day(start)} {start.year}"
     if start.year == last.year:
         return f"{fmt_day(start)} to {fmt_day(last)} {last.year}"
     return f"{fmt_day(start)} {start.year} to {fmt_day(last)} {last.year}"
