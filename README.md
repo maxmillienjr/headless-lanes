@@ -109,6 +109,8 @@ behind each one, is [docs/guardrails.md](docs/guardrails.md). Short version:
   default, and no decision is filed unless a human must decide.
 - Agents left files nobody tracked. Now a nightly lint finds them.
 
+Each of these has a script you can run in [failures/](failures/README.md) that reproduces the break and shows the guardrail catching it.
+
 ## Steal this
 
 Each of these is a few lines and works without the rest:
