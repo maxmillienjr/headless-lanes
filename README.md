@@ -149,6 +149,16 @@ Then install the units from [systemd/](systemd/README.md) and enable the timer. 
 
 `hooks/session-digest.py` prints the same state at the start of an interactive session.
 
+## A week at a glance
+
+`bin/lanes report` prints the last full week per seat and lane: runs, ok, failed, locked and
+minutes, with totals (`--week`, `--days`, `--json`). `bin/lanes report --export` writes the same
+week with the lanes collapsed into generic kinds through an allowlist you write, so you can show
+the shape of a week without showing what your lanes do, and
+[examples/week-video](examples/week-video) renders that file as a 30-second video.
+
+![A demo week as a video frame](docs/img/week-video.png)
+
 ## Limits, said plainly
 
 - The console has no login. It binds to 127.0.0.1, refuses requests for any other host and

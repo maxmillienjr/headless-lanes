@@ -18,7 +18,10 @@
   lanes dispatch-check [label]                  approved decisions a dispatcher should work; exit 1 if none
   lanes seat-dir <seat>                         the seat's Claude config directory
   lanes stopped [lane]                          exit 0 and print the STOP file if the kill switch is on
-  lanes seed-demo <dir>                         made-up data, written only inside <dir>
+  lanes report [--week YYYY-MM-DD | --days N] [--json]
+                                                one week per seat and lane: runs, ok, failed, locked, minutes
+  lanes report --export FILE --kinds KINDS.toml the same window, anonymised, for a picture
+  lanes seed-demo <dir> [--at YYYY-MM-DDTHH:MM] made-up data, written only inside <dir>
 
 Env: LANES_DB (default ~/.local/share/headless-lanes/lanes.db), LANES_DIR (the folder holding
 <lane>.md prompts and lanes.toml; default ./lanes beside this script's repo), LANES_LOG_DIR
@@ -497,6 +500,147 @@ def pull(db):
     return changed
 
 
+# ---------------------------------------------------------------- weekly report and export
+# A kinds file maps a lane to one of these. It is an allowlist: a lane it does not name is left
+# out of the export and only counted. Kinds are a closed set so a lane name can't ride through
+# as a kind.
+EXPORT_KINDS = ("report", "pipeline", "render", "dispatcher", "build")
+FAILED = ("error", "timeout")
+
+
+def week_window(week=None, days=None, at=None):
+    """(start, end) as naive local datetimes. `week` is a Monday (YYYY-MM-DD) and the window is
+    that Monday 00:00 to the next one; `days` is the last N days up to `at`; neither means the
+    last full Monday-to-Sunday week before `at`."""
+    at = at or now()
+    if week and days:
+        raise ValueError("pick one of --week and --days")
+    if days:
+        if days < 1:
+            raise ValueError("--days must be 1 or more")
+        return at - dt.timedelta(days=days), at
+    if week:
+        try:
+            d = dt.date.fromisoformat(week)
+        except ValueError:
+            raise ValueError(f"--week takes a date, YYYY-MM-DD; got {week}") from None
+        if d.weekday() != 0:
+            raise ValueError(f"--week takes a Monday; {week} is a {d:%A}")
+    else:
+        d = at.date() - dt.timedelta(days=at.weekday() + 7)
+    start = dt.datetime.combine(d, dt.time())
+    return start, start + dt.timedelta(days=7)
+
+
+def run_seconds(r):
+    """A run's length from its own start and end stamps, never the stored duration. A row with
+    no end (a runner killed before it could write one) counts as zero."""
+    if not r["ended"]:
+        return 0
+    return max(0, round((parse_ts(r["ended"]) - parse_ts(r["started"])).total_seconds()))
+
+
+def window_runs(db, start, end):
+    """Runs that started inside [start, end), oldest first. Compared as datetimes, not text,
+    because the runner's stamps may carry an offset."""
+    rows = db.execute("select * from lane_runs where started >= ? and started < ? order by started, id",
+                      (stamp(start - dt.timedelta(days=1)), stamp(end + dt.timedelta(days=1)))).fetchall()
+    return [r for r in rows if start <= parse_ts(r["started"]) < end]
+
+
+def tally(rows):
+    t = {"runs": len(rows), "ok": 0, "failed": 0, "locked": 0, "seconds": 0}
+    for r in rows:
+        t["ok" if r["status"] == "ok" else "locked" if r["status"] == "locked" else "failed"] += 1
+        t["seconds"] += run_seconds(r)
+    t["minutes"] = round(t["seconds"] / 60, 1)
+    return t
+
+
+def week_report(db, start, end):
+    """Counts per seat and lane for one window: runs, ok, failed (error or timeout), locked (gave
+    up waiting for the seat), and minutes run from the start and end stamps."""
+    rows = window_runs(db, start, end)
+    seats = []
+    for seat in sorted({r["seat"] for r in rows}):
+        mine = [r for r in rows if r["seat"] == seat]
+        lanes = [{"lane": lane, **tally([r for r in mine if r["lane"] == lane])}
+                 for lane in sorted({r["lane"] for r in mine})]
+        seats.append({"seat": seat, "lanes": lanes, "total": tally(mine)})
+    return {"start": stamp(start), "end": stamp(end), "seats": seats, "total": tally(rows)}
+
+
+def read_kinds(path):
+    """The allowlist: [kinds] lane = "kind". Anything else in the file is an error, so a typo
+    can't widen what the export shows."""
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    if set(data) != {"kinds"} or not isinstance(data["kinds"], dict):
+        raise ValueError(f"{path}: expected one [kinds] table and nothing else")
+    for lane, kind in data["kinds"].items():
+        if kind not in EXPORT_KINDS:
+            raise ValueError(f"{path}: {lane} = {kind!r}; a kind is one of {', '.join(EXPORT_KINDS)}")
+    return data["kinds"]
+
+
+def week_export(db, start, end, kinds):
+    """The anonymised window for a picture. Per run: seat label, kind, start and end in seconds
+    from the window's start, status. No lane name, seat name, log, summary, session or tokens.
+    Lanes not in `kinds` are left out and counted, so the picture can say it is a subset."""
+    rows = window_runs(db, start, end)
+    shown = [r for r in rows if r["lane"] in kinds]
+    labels = {seat: f"seat {i}" for i, seat in enumerate(sorted({r["seat"] for r in shown}), 1)}
+    runs = []
+    for r in shown:
+        s = round((parse_ts(r["started"]) - start).total_seconds())
+        runs.append({"seat": labels[r["seat"]], "kind": kinds[r["lane"]], "start_s": s,
+                     "end_s": s + run_seconds(r), "status": r["status"]})
+    return {"format": "lanes-week-export/1",
+            "window": {"start": stamp(start), "end": stamp(end),
+                       "days": round((end - start).total_seconds() / 86400, 3), "seconds": round((end - start).total_seconds())},
+            "seats": list(labels.values()),
+            "kinds": sorted({r["kind"] for r in runs}, key=EXPORT_KINDS.index),
+            "lanes_shown": len({r["lane"] for r in shown}),
+            "runs_left_out": len(rows) - len(shown),
+            "totals": tally(shown),
+            "runs": runs}
+
+
+def export_text(ex):
+    """The export as JSON with one run per line, so a person can read it and a diff stays short."""
+    head = json.dumps({**ex, "runs": None}, indent=1)
+    runs = ",\n".join("  " + json.dumps(r) for r in ex["runs"])
+    return head.replace('"runs": null', '"runs": [\n' + runs + "\n ]" if runs else '"runs": []') + "\n"
+
+
+def print_report(rep, out=None):
+    out = out or sys.stdout
+    def hm(s):
+        return f"{s // 3600}h {s % 3600 // 60:02d}m"
+
+    line = f"{'':<2}{'{:<22}'}{'{:>6}'}{'{:>6}'}{'{:>8}'}{'{:>8}'}{'{:>10}'}{'{:>10}'}"
+    head = line.format("", "runs", "ok", "failed", "locked", "minutes", "")
+    start, end = parse_ts(rep["start"]), parse_ts(rep["end"])
+    last = end - dt.timedelta(seconds=1)
+    print(f"Runs that started {start:%a %Y-%m-%d %H:%M} to {last:%a %Y-%m-%d %H:%M}", file=out)
+    if not rep["seats"]:
+        print("  no runs in this window", file=out)
+        return
+    print(head.rstrip(), file=out)
+    for s in rep["seats"]:
+        print(f"seat {s['seat']}", file=out)
+        for ln in s["lanes"]:
+            print(line.format(ln["lane"][:21], ln["runs"], ln["ok"], ln["failed"], ln["locked"],
+                              f"{ln['minutes']:.1f}", "").rstrip(), file=out)
+        t = s["total"]
+        print(line.format("seat total", t["runs"], t["ok"], t["failed"], t["locked"], f"{t['minutes']:.1f}",
+                          hm(t["seconds"])).rstrip(), file=out)
+    t = rep["total"]
+    print(f"{'total':<24}{t['runs']:>6}{t['ok']:>6}{t['failed']:>8}{t['locked']:>8}{t['minutes']:>10.1f}{hm(t['seconds']):>10}", file=out)
+    print("failed = error or timeout. locked = gave up waiting for the seat (logged when it gave up; "
+          "the wait itself is not recorded).", file=out)
+
+
 # ---------------------------------------------------------------- demo seed (everything invented)
 def tiny_pdf(lines):
     """A one-page PDF from plain lines, by hand, so the demo needs no PDF library."""
@@ -557,10 +701,11 @@ roots = ["{out}"]
 """
 
 
-def seed_demo(root):
+def seed_demo(root, at=None):
     """Fill the database and `root` with about 60 runs, 14 inbox rows and 6 decisions. Uses
     whatever LANES_DB / LANES_DIR / LANES_LOG_DIR point at; the console's --demo aims them at a
-    temp folder first. All of it is made up."""
+    temp folder first. All of it is made up. The runs are dated back from `at` (default now), so
+    a fixed `at` gives the same runs on every machine."""
     root = os.path.realpath(root)
     for p in (db_path(), lanes_dir(), log_dir()):
         if not os.path.realpath(p).startswith(root + os.sep):  # never the real database or the real lanes.toml
@@ -573,7 +718,7 @@ def seed_demo(root):
         raise ValueError(f"{db_path()} already has runs; seed-demo only fills an empty database")
     with open(os.path.join(ldir, "lanes.toml"), "w") as f:
         f.write(DEMO_TOML.format(out=out))
-    t0 = now().replace(minute=0, second=0, microsecond=0)
+    t0 = (at or now()).replace(minute=0, second=0, microsecond=0)
     day = dt.timedelta(days=1)
 
     def ago(days, hour, minute=0):
@@ -611,6 +756,11 @@ def seed_demo(root):
     for i, d in enumerate((2, 5, 6, 9, 12, 15, 19, 22, 26)):
         run("main", "dispatcher", ago(d, 7, 31), 540 + 80 * (i % 4), 38 + 6 * (i % 3),
             summary=f"D-{3 if i == 0 else 5} -> {'todo: draft is in the inbox, the send is yours' if i == 0 else 'done'}")
+    # one long dispatch held the main seat for 48 minutes; a repo-lint started by hand at 07:44
+    # waited its 30 minutes for the seat and gave up. The runner logs that as `locked`, stamped
+    # when it gave up (started and ended are the same moment).
+    run("main", "dispatcher", ago(3, 7, 31), 2880, 112, summary="D-5 -> done (a long one: 9 files on the branch)")
+    run("main", "repo-lint", ago(3, 8, 14), 0, 0, "locked", "", "seat main is busy (lock held by another run); giving up")
     # the pipeline: source (fortnightly, now past cadence), strike (after a pick), follow-up (Tue, Fri).
     run("outreach", "pipeline-source", ago(19, 8, 33), 780, 61, summary="7 keepers of 15 candidates. Pick list filed as D-1.")
     run("outreach", "pipeline-source", ago(33, 8, 31), 705, 55, summary="6 keepers of 13 candidates. Pick list filed.")
@@ -943,11 +1093,37 @@ def cmd_stopped(a):
     return 0 if path else 1
 
 
+def cmd_report(a):
+    start, end = week_window(a.week, a.days)
+    db = connect()
+    if a.export:
+        if not a.kinds:
+            sys.exit("lanes report: --export needs --kinds KINDS.toml (the allowlist of lanes to show)")
+        ex = week_export(db, start, end, read_kinds(a.kinds))
+        with open(a.export, "w") as f:
+            f.write(export_text(ex))
+        print(f"wrote {a.export}: {ex['totals']['runs']} runs from {ex['lanes_shown']} lane(s) on "
+              f"{len(ex['seats'])} seat(s); {ex['runs_left_out']} run(s) left out", file=sys.stderr)
+        return 0
+    if a.kinds:
+        sys.exit("lanes report: --kinds only goes with --export")
+    rep = week_report(db, start, end)
+    if a.json:
+        print(json.dumps(rep, indent=1))
+    else:
+        print_report(rep)
+    return 0
+
+
 def cmd_seed_demo(a):
     root = os.path.realpath(a.dir)
     os.environ.update(LANES_DB=os.path.join(root, "lanes.db"), LANES_DIR=os.path.join(root, "lanes"),
                       LANES_LOG_DIR=os.path.join(root, "logs"))
-    seed_demo(root).close()
+    try:
+        at = dt.datetime.fromisoformat(a.at) if a.at else None
+    except ValueError:
+        sys.exit(f"lanes seed-demo: --at takes YYYY-MM-DDTHH:MM; got {a.at}")
+    seed_demo(root, at).close()
     print(f"seeded {root}\n  export LANES_DB={os.environ['LANES_DB']} LANES_DIR={os.environ['LANES_DIR']} "
           f"LANES_LOG_DIR={os.environ['LANES_LOG_DIR']}")
     return 0
@@ -1003,8 +1179,16 @@ def main(argv=None):
     p = sub.add_parser("stopped")
     p.add_argument("lane", nargs="?")
     p.set_defaults(fn=cmd_stopped)
+    p = sub.add_parser("report")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--week", help="the Monday that starts the week (default: the last full week)")
+    g.add_argument("--days", type=int, help="the last N days instead of a calendar week")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--export", metavar="FILE"), p.add_argument("--kinds", metavar="KINDS.toml")
+    p.set_defaults(fn=cmd_report)
     p = sub.add_parser("seed-demo")
     p.add_argument("dir")
+    p.add_argument("--at", help="date the runs back from this moment instead of now (a reproducible seed)")
     p.set_defaults(fn=cmd_seed_demo)
     a = ap.parse_args(argv)
     try:
